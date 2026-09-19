@@ -1,0 +1,596 @@
+# from fastapi import FastAPI, UploadFile, File
+
+# app = FastAPI()
+
+
+# @app.get("/")
+# async def root():
+#     return {
+#         "status": "ok",
+#         "service": "EACT FastAPI backend",
+#     }
+
+
+# @app.post("/api/eact")
+# async def upload_eact(file: UploadFile = File(...)):
+#     total_bytes = 0
+
+#     while True:
+#         chunk = await file.read(1024 * 1024)
+
+#         if not chunk:
+#             break
+
+#         total_bytes += len(chunk)
+
+#     return {
+#         "status": "ok",
+#         "filename": file.filename,
+#         "size_bytes": total_bytes,
+#     }
+
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, date
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from zipfile import ZipFile
+import re
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from openpyxl import load_workbook
+
+#adicionei isto
+app = FastAPI()
+
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+def normalize(value) -> str:
+    if value is None:
+        return ""
+
+    return (
+        str(value)
+        .normalize("NFD")
+        if False
+        else str(value)
+    )
+
+
+def normalize_text(value) -> str:
+    if value is None:
+        return ""
+
+    import unicodedata
+
+    return (
+        unicodedata.normalize("NFD", str(value))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+        .strip()
+    )
+
+
+def norm_val(value) -> str:
+    if value is None:
+        return ""
+
+    return (
+        str(value)
+        .replace("\u00a0", " ")
+        .strip()
+        .upper()
+    )
+
+
+# ============================================================
+# DT_ACT
+# ============================================================
+
+def parse_dt_act(value, ref_for_century: datetime | date):
+    """
+    DT_ACT vem como texto 'AA.MM.DD'.
+
+    Exemplo:
+        24.05.17 -> 17/05/2024
+
+    Se 20XX ficar no futuro relativamente à referência,
+    assume-se 19XX.
+    """
+
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+
+    match = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{2})", value)
+
+    if not match:
+        return None
+
+    yy, mm, dd = match.groups()
+
+    year = 2000 + int(yy)
+
+    try:
+        parsed = datetime(year, int(mm), int(dd))
+    except ValueError:
+        return None
+
+    if parsed > _as_datetime(ref_for_century):
+        year = 1900 + int(yy)
+
+        try:
+            parsed = datetime(year, int(mm), int(dd))
+        except ValueError:
+            return None
+
+    return parsed
+
+
+def _as_datetime(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    return datetime.now()
+
+
+# ============================================================
+# CREATED DATE
+# ============================================================
+
+def get_created_date(file_path: str):
+    """
+    Lê docProps/core.xml diretamente do XLSX.
+
+    XLSX é um ZIP e a data de criação fica em:
+        docProps/core.xml
+    """
+
+    try:
+        with ZipFile(file_path, "r") as archive:
+            try:
+                xml_bytes = archive.read("docProps/core.xml")
+            except KeyError:
+                return None
+
+        xml = xml_bytes.decode("utf-8", errors="ignore")
+
+        match = re.search(
+            r"<dcterms:created[^>]*>([^<]+)</dcterms:created>",
+            xml,
+        )
+
+        if not match:
+            return None
+
+        value = match.group(1)
+
+        # ISO 8601, normalmente algo como:
+        # 2026-09-18T07:35:21Z
+        value = value.replace("Z", "+00:00")
+
+        try:
+            parsed = datetime.fromisoformat(value)
+
+            # Trabalhamos com datetimes naive para evitar
+            # problemas de comparação timezone-aware vs naive.
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+
+            return parsed
+
+        except ValueError:
+            return None
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# EACT PROCESSING
+# ============================================================
+
+def process_eact(file_path: str):
+    created_date = get_created_date(file_path)
+
+    workbook = load_workbook(
+        filename=file_path,
+        read_only=True,
+        data_only=True,
+    )
+
+    try:
+        total_bruto = 0
+
+        vistos_enc = set()
+        encerradas = 0
+
+        vistos_solta = set()
+        entidades_solta_count = 0
+
+        # Entidades EACT:
+        #
+        # 1 registo por ENTIDADE_ASSOCIADA
+        #
+        # Guarda apenas a primeira ocorrência.
+        entidades_eact = {}
+
+        max_dt_act_raw = None
+        max_dt_act_parsed_for_now = None
+
+        consecutive_empty = 0
+
+        # --------------------------------------------------------
+        # Procurar folha EXPORT
+        # --------------------------------------------------------
+
+        worksheet = None
+
+        for ws in workbook.worksheets:
+            sheet_name = normalize_text(ws.title)
+
+            if "export" in sheet_name:
+                worksheet = ws
+                break
+
+        if worksheet is None:
+            raise ValueError("Não foi encontrada a folha EXPORT no ficheiro EACT.")
+
+        # --------------------------------------------------------
+        # Ler linhas
+        # --------------------------------------------------------
+
+        rows = worksheet.iter_rows(values_only=True)
+
+        try:
+            header_row = next(rows)
+        except StopIteration:
+            raise ValueError("A folha EXPORT está vazia.")
+
+        # Python/openpyxl devolve tuplos 0-based.
+        #
+        # Criamos um mapa:
+        #
+        # DSC_SIT -> índice
+        # COD_CONTRATO -> índice
+        # etc.
+        #
+        header = [normalize_text(value) for value in header_row]
+
+        def find_column(name: str) -> int:
+            target = normalize_text(name)
+
+            try:
+                return header.index(target)
+            except ValueError:
+                return -1
+
+        c_sit = find_column("DSC_SIT")
+        c_contrato = find_column("COD_CONTRATO")
+        c_ent_solta = find_column("ENTIDADE_SOLTA")
+        c_ent_assoc = find_column("ENTIDADE_ASSOCIADA")
+        c_info_act = find_column("INFO_ACT")
+        c_dt_act = find_column("DT_ACT")
+        c_emp_part = find_column("DSC_EMP_PART")
+        c_doc_valido = find_column("DOCUMENTO_VALIDO")
+
+        required_columns = {
+            "DSC_SIT": c_sit,
+            "COD_CONTRATO": c_contrato,
+            "ENTIDADE_SOLTA": c_ent_solta,
+            "ENTIDADE_ASSOCIADA": c_ent_assoc,
+            "INFO_ACT": c_info_act,
+            "DT_ACT": c_dt_act,
+            "DSC_EMP_PART": c_emp_part,
+            "DOCUMENTO_VALIDO": c_doc_valido,
+        }
+
+        missing = [
+            name
+            for name, index in required_columns.items()
+            if index == -1
+        ]
+
+        if missing:
+            raise ValueError(
+                "Colunas obrigatórias em falta: " + ", ".join(missing)
+            )
+
+        # --------------------------------------------------------
+        # Processamento principal
+        # --------------------------------------------------------
+
+        for row in rows:
+
+            # Uma linha completamente vazia.
+            if all(value is None for value in row):
+                consecutive_empty += 1
+
+                # O ficheiro pode declarar 1.048.576 linhas,
+                # mas não queremos percorrer todas as linhas vazias.
+                if consecutive_empty > 2000:
+                    break
+
+                continue
+
+            consecutive_empty = 0
+
+            total_bruto += 1
+
+            def get_value(index):
+                if index >= len(row):
+                    return None
+
+                return row[index]
+
+            sit = norm_val(get_value(c_sit))
+            ent_solta = norm_val(get_value(c_ent_solta))
+
+            # ====================================================
+            # ENCERRADAS
+            # ====================================================
+
+            if sit == "ENCERRADA":
+                key = get_value(c_contrato)
+
+                if key not in vistos_enc:
+                    vistos_enc.add(key)
+                    encerradas += 1
+
+            # ====================================================
+            # ENTIDADES SOLTAS
+            # ====================================================
+
+            if ent_solta == "SIM":
+                key = get_value(c_ent_assoc)
+
+                if key not in vistos_solta:
+                    vistos_solta.add(key)
+                    entidades_solta_count += 1
+
+            # ====================================================
+            # ENTIDADES EACT
+            # ====================================================
+
+            if sit != "ENCERRADA" and ent_solta == "NAO":
+
+                ent = get_value(c_ent_assoc)
+
+                if ent not in entidades_eact:
+                    entidades_eact[ent] = {
+                        "infoAct": get_value(c_info_act),
+                        "dtActRaw": get_value(c_dt_act),
+                        "empPart": get_value(c_emp_part),
+                        "docValido": get_value(c_doc_valido),
+                    }
+
+                # ------------------------------------------------
+                # Data máxima provisória
+                # ------------------------------------------------
+
+                provisional_ref = (
+                    max_dt_act_parsed_for_now
+                    if max_dt_act_parsed_for_now is not None
+                    else datetime.now()
+                )
+
+                dt_raw = get_value(c_dt_act)
+
+                d_parsed = parse_dt_act(
+                    dt_raw,
+                    provisional_ref,
+                )
+
+                if (
+                    d_parsed is not None
+                    and (
+                        max_dt_act_parsed_for_now is None
+                        or d_parsed > max_dt_act_parsed_for_now
+                    )
+                ):
+                    max_dt_act_parsed_for_now = d_parsed
+
+                    if isinstance(dt_raw, str):
+                        max_dt_act_raw = dt_raw
+
+        # ========================================================
+        # RESULTADOS BASE
+        # ========================================================
+
+        total_entidades = len(entidades_eact)
+
+        # ========================================================
+        # DATA MÁXIMA FINAL
+        # ========================================================
+
+        final_ref = created_date or datetime.now()
+
+        max_dt_act = (
+            parse_dt_act(max_dt_act_raw, final_ref)
+            if max_dt_act_raw
+            else None
+        )
+
+        # ========================================================
+        # FIABILIZADAS
+        # ========================================================
+
+        fiabilizadas = 0
+
+        if max_dt_act is not None:
+
+            same_day = False
+
+            if created_date is not None:
+                same_day = (
+                    max_dt_act.year == created_date.year
+                    and max_dt_act.month == created_date.month
+                    and max_dt_act.day == created_date.day
+                )
+
+            ref_date = max_dt_act
+
+            if same_day:
+                from datetime import timedelta
+
+                ref_date = ref_date - timedelta(days=1)
+
+            inicio_janela = ref_date.replace(
+                year=ref_date.year - 2
+            )
+
+            for entity in entidades_eact.values():
+
+                info_act = entity["infoAct"]
+                dt_act_raw = entity["dtActRaw"]
+                emp_part = entity["empPart"]
+                doc_valido = entity["docValido"]
+
+                # INFO_ACT precisa ser SIM.
+                if norm_val(info_act) != "SIM":
+                    continue
+
+                dt = parse_dt_act(
+                    dt_act_raw,
+                    final_ref,
+                )
+
+                if dt is None:
+                    continue
+
+                if dt < inicio_janela or dt > ref_date:
+                    continue
+
+                ep = norm_val(emp_part)
+
+                # EMPRESA
+                if ep == "EMPRESA":
+                    fiabilizadas += 1
+
+                # PARTICULAR
+                elif ep == "PARTICULAR":
+
+                    dv = norm_val(doc_valido)
+
+                    if dv in {
+                        "SIM",
+                        "SEM DATA DE VALIDADE",
+                    }:
+                        fiabilizadas += 1
+
+        # ========================================================
+        # POR FIABILIZAR
+        # ========================================================
+
+        por_fiabilizar = total_entidades - fiabilizadas
+
+        return {
+            "totalBruto": total_bruto,
+            "encerradas": encerradas,
+            "entidadesSoltas": entidades_solta_count,
+            "totalEntidades": total_entidades,
+            "fiabilizadas": fiabilizadas,
+            "porFiabilizar": por_fiabilizar,
+        }
+
+    finally:
+        workbook.close()
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "EACT FastAPI backend",
+    }
+
+
+@app.post("/api/eact")
+async def upload_eact(file: UploadFile = File(...)):
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Ficheiro em falta.",
+        )
+
+    temp_path = None
+
+    try:
+        # --------------------------------------------------------
+        # Guardar upload em disco por chunks
+        # --------------------------------------------------------
+
+        with NamedTemporaryFile(
+            suffix=".xlsx",
+            prefix="eact-",
+            delete=False,
+        ) as temp:
+
+            temp_path = temp.name
+
+            while True:
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                temp.write(chunk)
+
+        # --------------------------------------------------------
+        # Processar Excel
+        # --------------------------------------------------------
+
+        result = process_eact(temp_path)
+
+        return result
+
+    except Exception as exc:
+
+        print(f"Erro /api/eact: {type(exc).__name__}: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    finally:
+
+        await file.close()
+
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+# @app.post("/api/eact")
+# async def upload_eact(file: UploadFile = File(...)):
+#     print("CHEGOU AO FASTAPI")
+
+#     return {
+#         "ok": True,
+#         "message": "FastAPI recebeu a requisição"
+#     }
+
+

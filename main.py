@@ -555,7 +555,6 @@
 #                 pass
 
 
-
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -563,37 +562,49 @@ from tempfile import NamedTemporaryFile
 from zipfile import ZipFile
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import os
 import re
 import uuid
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 
 from openpyxl import load_workbook
 
 app = FastAPI()
 
+# Em produção, defina FRONTEND_ORIGIN no Railway com o domínio
+# do seu frontend na Vercel (ex: https://o-seu-app.vercel.app)
+allowed_origins = ["http://localhost:3000"]
+prod_origin = os.getenv("FRONTEND_ORIGIN")
+if prod_origin:
+    allowed_origins.append(prod_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ============================================================
-# JOBS EM MEMÓRIA
+# ESTADO EM MEMÓRIA
 # ============================================================
 #
-# Guarda o estado de cada processamento em curso:
+# uploads: acompanha uploads em pedaços ainda em curso
+#   uploads[uploadId] = {"path": "...", "received": 3, "total": 29}
+#
+# jobs: acompanha o processamento depois do upload terminar
 #   jobs[job_id] = {"status": "processing"}
 #   jobs[job_id] = {"status": "done", "result": {...}}
 #   jobs[job_id] = {"status": "error", "error": "..."}
 #
-# NOTA: isto vive em memória do processo. Se o serviço reiniciar
-# a meio de um job, esse job perde-se. Para o volume de uso atual
-# (uso interno, um utilizador de cada vez) isto é aceitável; se no
-# futuro precisar de robustez entre reinícios, trocar por Redis ou
-# uma tabela na base de dados.
+# NOTA: vive em memória do processo — se o serviço reiniciar a
+# meio de um upload/processamento, esse job perde-se. Aceitável
+# para o volume de uso atual (uso interno, um utilizador de cada
+# vez). Se precisar de robustez entre reinícios, trocar por Redis
+# ou uma tabela na base de dados.
+uploads: dict[str, dict] = {}
 jobs: dict[str, dict] = {}
 
 executor = ThreadPoolExecutor(max_workers=2)
@@ -726,7 +737,7 @@ def get_created_date(file_path: str):
 
 
 # ============================================================
-# EACT PROCESSING (inalterado — mesma lógica de sempre)
+# EACT PROCESSING (inalterado)
 # ============================================================
 
 def process_eact(file_path: str):
@@ -949,9 +960,6 @@ async def run_processing(job_id: str, temp_path: str):
     loop = asyncio.get_event_loop()
 
     try:
-        # Corre process_eact numa thread separada, para não bloquear
-        # o event loop principal (e continuar a servir /status durante
-        # o processamento).
         result = await loop.run_in_executor(executor, process_eact, temp_path)
         jobs[job_id] = {"status": "done", "result": result}
 
@@ -977,48 +985,58 @@ async def root():
     return {"status": "ok", "service": "EACT FastAPI backend"}
 
 
-@app.post("/api/eact/start")
-async def start_eact(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Ficheiro em falta.")
+@app.post("/api/eact/upload-chunk")
+async def upload_chunk(
+    file: UploadFile = File(...),
+    uploadId: str = Form(...),
+    chunkIndex: int = Form(...),
+    totalChunks: int = Form(...),
+):
+    """
+    Recebe UM pedaço do ficheiro de cada vez (ex: 5MB). Cada
+    pedaço é um request pequeno e rápido — nunca fica perto de
+    nenhum timeout de proxy, seja qual for a velocidade de upload
+    do utilizador.
 
-    job_id = str(uuid.uuid4())
-    temp_path = None
+    O frontend envia os pedaços em ordem, um a um (espera a
+    resposta de cada um antes de enviar o seguinte), por isso
+    basta concatenar por ordem de chegada.
+    """
 
-    try:
-        with NamedTemporaryFile(
-            suffix=".xlsx",
-            prefix="eact-",
-            delete=False,
-        ) as temp:
+    if uploadId not in uploads:
+        temp = NamedTemporaryFile(suffix=".xlsx", prefix="eact-", delete=False)
+        temp_path = temp.name
+        temp.close()
 
-            temp_path = temp.name
+        uploads[uploadId] = {
+            "path": temp_path,
+            "received": 0,
+            "total": totalChunks,
+        }
 
-            while True:
-                chunk = await file.read(1024 * 1024)
+    info = uploads[uploadId]
 
-                if not chunk:
-                    break
+    chunk_bytes = await file.read()
 
-                temp.write(chunk)
+    with open(info["path"], "ab") as f:
+        f.write(chunk_bytes)
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao guardar o ficheiro: {type(exc).__name__}: {exc}",
-        )
+    info["received"] += 1
 
-    finally:
-        await file.close()
+    is_last = info["received"] >= info["total"]
 
-    jobs[job_id] = {"status": "processing"}
+    if is_last:
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {"status": "processing"}
 
-    # Agenda o processamento pesado e devolve a resposta já,
-    # sem esperar que termine. É isto que evita o timeout de
-    # 5 minutos do proxy do Railway.
-    asyncio.create_task(run_processing(job_id, temp_path))
+        temp_path = info["path"]
+        del uploads[uploadId]
 
-    return {"job_id": job_id}
+        asyncio.create_task(run_processing(job_id, temp_path))
+
+        return {"done": True, "job_id": job_id}
+
+    return {"done": False, "received": info["received"], "total": info["total"]}
 
 
 @app.get("/api/eact/status/{job_id}")

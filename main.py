@@ -574,7 +574,7 @@ app = FastAPI()
 
 # Em produção, defina FRONTEND_ORIGIN no Railway com o domínio
 # do seu frontend na Vercel (ex: https://o-seu-app.vercel.app)
-allowed_origins = ["http://localhost:3000"]
+allowed_origins = ["https://mozabanco-relatorios-clientes-e-contas.vercel.app/"]
 prod_origin = os.getenv("FRONTEND_ORIGIN")
 if prod_origin:
     allowed_origins.append(prod_origin)

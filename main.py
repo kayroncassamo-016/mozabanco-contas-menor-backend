@@ -1,41 +1,58 @@
 
+
 # from fastapi.middleware.cors import CORSMiddleware
-# from datetime import datetime, date
+# from datetime import datetime, date, timedelta
 # from pathlib import Path
 # from tempfile import NamedTemporaryFile
 # from zipfile import ZipFile
+# from concurrent.futures import ThreadPoolExecutor
+# import asyncio
+# import os
 # import re
+# import uuid
 
-# from fastapi import FastAPI, UploadFile, File, HTTPException
+# from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
 # from openpyxl import load_workbook
 
-# #adicionei isto
 # app = FastAPI()
 
-
+# # Em produção, defina FRONTEND_ORIGIN no Railway com o domínio
+# # do seu frontend na Vercel (ex: https://o-seu-app.vercel.app)
+# allowed_origins = ["http://localhost:3000", "https://mozabanco-relatorios-clientes-e-contas.vercel.app"]
+# prod_origin = os.getenv("FRONTEND_ORIGIN")
+# if prod_origin:
+#     allowed_origins.append(prod_origin)
 
 # app.add_middleware(
 #     CORSMiddleware,
-#     allow_origins=[
-#         "http://localhost:3000",
-#     ],
+#     allow_origins=allowed_origins,
 #     allow_credentials=True,
 #     allow_methods=["*"],
 #     allow_headers=["*"],
 # )
 
+# # ============================================================
+# # ESTADO EM MEMÓRIA
+# # ============================================================
+# #
+# # uploads: acompanha uploads em pedaços ainda em curso
+# #   uploads[uploadId] = {"path": "...", "received": 3, "total": 29}
+# #
+# # jobs: acompanha o processamento depois do upload terminar
+# #   jobs[job_id] = {"status": "processing"}
+# #   jobs[job_id] = {"status": "done", "result": {...}}
+# #   jobs[job_id] = {"status": "error", "error": "..."}
+# #
+# # NOTA: vive em memória do processo — se o serviço reiniciar a
+# # meio de um upload/processamento, esse job perde-se. Aceitável
+# # para o volume de uso atual (uso interno, um utilizador de cada
+# # vez). Se precisar de robustez entre reinícios, trocar por Redis
+# # ou uma tabela na base de dados.
+# uploads: dict[str, dict] = {}
+# jobs: dict[str, dict] = {}
 
-
-# def normalize(value) -> str:
-#     if value is None:
-#         return ""
-
-#     return (
-#         str(value)
-#         .normalize("NFD")
-#         if False
-#         else str(value)
-#     )
+# executor = ThreadPoolExecutor(max_workers=2)
 
 
 # def normalize_text(value) -> str:
@@ -126,10 +143,7 @@
 
 # def get_created_date(file_path: str):
 #     """
-#     Lê docProps/core.xml diretamente do XLSX.
-
-#     XLSX é um ZIP e a data de criação fica em:
-#         docProps/core.xml
+#     Lê docProps/core.xml diretamente do XLSX (que é um ZIP).
 #     """
 
 #     try:
@@ -150,16 +164,11 @@
 #             return None
 
 #         value = match.group(1)
-
-#         # ISO 8601, normalmente algo como:
-#         # 2026-09-18T07:35:21Z
 #         value = value.replace("Z", "+00:00")
 
 #         try:
 #             parsed = datetime.fromisoformat(value)
 
-#             # Trabalhamos com datetimes naive para evitar
-#             # problemas de comparação timezone-aware vs naive.
 #             if parsed.tzinfo is not None:
 #                 parsed = parsed.astimezone().replace(tzinfo=None)
 
@@ -173,7 +182,7 @@
 
 
 # # ============================================================
-# # EACT PROCESSING
+# # EACT PROCESSING (inalterado)
 # # ============================================================
 
 # def process_eact(file_path: str):
@@ -194,21 +203,12 @@
 #         vistos_solta = set()
 #         entidades_solta_count = 0
 
-#         # Entidades EACT:
-#         #
-#         # 1 registo por ENTIDADE_ASSOCIADA
-#         #
-#         # Guarda apenas a primeira ocorrência.
 #         entidades_eact = {}
 
 #         max_dt_act_raw = None
 #         max_dt_act_parsed_for_now = None
 
 #         consecutive_empty = 0
-
-#         # --------------------------------------------------------
-#         # Procurar folha EXPORT
-#         # --------------------------------------------------------
 
 #         worksheet = None
 
@@ -222,10 +222,6 @@
 #         if worksheet is None:
 #             raise ValueError("Não foi encontrada a folha EXPORT no ficheiro EACT.")
 
-#         # --------------------------------------------------------
-#         # Ler linhas
-#         # --------------------------------------------------------
-
 #         rows = worksheet.iter_rows(values_only=True)
 
 #         try:
@@ -233,14 +229,6 @@
 #         except StopIteration:
 #             raise ValueError("A folha EXPORT está vazia.")
 
-#         # Python/openpyxl devolve tuplos 0-based.
-#         #
-#         # Criamos um mapa:
-#         #
-#         # DSC_SIT -> índice
-#         # COD_CONTRATO -> índice
-#         # etc.
-#         #
 #         header = [normalize_text(value) for value in header_row]
 
 #         def find_column(name: str) -> int:
@@ -271,72 +259,43 @@
 #             "DOCUMENTO_VALIDO": c_doc_valido,
 #         }
 
-#         missing = [
-#             name
-#             for name, index in required_columns.items()
-#             if index == -1
-#         ]
+#         missing = [name for name, index in required_columns.items() if index == -1]
 
 #         if missing:
-#             raise ValueError(
-#                 "Colunas obrigatórias em falta: " + ", ".join(missing)
-#             )
-
-#         # --------------------------------------------------------
-#         # Processamento principal
-#         # --------------------------------------------------------
+#             raise ValueError("Colunas obrigatórias em falta: " + ", ".join(missing))
 
 #         for row in rows:
 
-#             # Uma linha completamente vazia.
 #             if all(value is None for value in row):
 #                 consecutive_empty += 1
 
-#                 # O ficheiro pode declarar 1.048.576 linhas,
-#                 # mas não queremos percorrer todas as linhas vazias.
 #                 if consecutive_empty > 2000:
 #                     break
 
 #                 continue
 
 #             consecutive_empty = 0
-
 #             total_bruto += 1
 
 #             def get_value(index):
 #                 if index >= len(row):
 #                     return None
-
 #                 return row[index]
 
 #             sit = norm_val(get_value(c_sit))
 #             ent_solta = norm_val(get_value(c_ent_solta))
 
-#             # ====================================================
-#             # ENCERRADAS
-#             # ====================================================
-
 #             if sit == "ENCERRADA":
 #                 key = get_value(c_contrato)
-
 #                 if key not in vistos_enc:
 #                     vistos_enc.add(key)
 #                     encerradas += 1
 
-#             # ====================================================
-#             # ENTIDADES SOLTAS
-#             # ====================================================
-
 #             if ent_solta == "SIM":
 #                 key = get_value(c_ent_assoc)
-
 #                 if key not in vistos_solta:
 #                     vistos_solta.add(key)
 #                     entidades_solta_count += 1
-
-#             # ====================================================
-#             # ENTIDADES EACT
-#             # ====================================================
 
 #             if sit != "ENCERRADA" and ent_solta == "NAO":
 
@@ -350,10 +309,6 @@
 #                         "docValido": get_value(c_doc_valido),
 #                     }
 
-#                 # ------------------------------------------------
-#                 # Data máxima provisória
-#                 # ------------------------------------------------
-
 #                 provisional_ref = (
 #                     max_dt_act_parsed_for_now
 #                     if max_dt_act_parsed_for_now is not None
@@ -361,45 +316,23 @@
 #                 )
 
 #                 dt_raw = get_value(c_dt_act)
+#                 d_parsed = parse_dt_act(dt_raw, provisional_ref)
 
-#                 d_parsed = parse_dt_act(
-#                     dt_raw,
-#                     provisional_ref,
-#                 )
-
-#                 if (
-#                     d_parsed is not None
-#                     and (
-#                         max_dt_act_parsed_for_now is None
-#                         or d_parsed > max_dt_act_parsed_for_now
-#                     )
+#                 if d_parsed is not None and (
+#                     max_dt_act_parsed_for_now is None
+#                     or d_parsed > max_dt_act_parsed_for_now
 #                 ):
 #                     max_dt_act_parsed_for_now = d_parsed
-
 #                     if isinstance(dt_raw, str):
 #                         max_dt_act_raw = dt_raw
 
-#         # ========================================================
-#         # RESULTADOS BASE
-#         # ========================================================
-
 #         total_entidades = len(entidades_eact)
-
-#         # ========================================================
-#         # DATA MÁXIMA FINAL
-#         # ========================================================
 
 #         final_ref = created_date or datetime.now()
 
 #         max_dt_act = (
-#             parse_dt_act(max_dt_act_raw, final_ref)
-#             if max_dt_act_raw
-#             else None
+#             parse_dt_act(max_dt_act_raw, final_ref) if max_dt_act_raw else None
 #         )
-
-#         # ========================================================
-#         # FIABILIZADAS
-#         # ========================================================
 
 #         fiabilizadas = 0
 
@@ -417,13 +350,9 @@
 #             ref_date = max_dt_act
 
 #             if same_day:
-#                 from datetime import timedelta
-
 #                 ref_date = ref_date - timedelta(days=1)
 
-#             inicio_janela = ref_date.replace(
-#                 year=ref_date.year - 2
-#             )
+#             inicio_janela = ref_date.replace(year=ref_date.year - 2)
 
 #             for entity in entidades_eact.values():
 
@@ -432,14 +361,10 @@
 #                 emp_part = entity["empPart"]
 #                 doc_valido = entity["docValido"]
 
-#                 # INFO_ACT precisa ser SIM.
 #                 if norm_val(info_act) != "SIM":
 #                     continue
 
-#                 dt = parse_dt_act(
-#                     dt_act_raw,
-#                     final_ref,
-#                 )
+#                 dt = parse_dt_act(dt_act_raw, final_ref)
 
 #                 if dt is None:
 #                     continue
@@ -449,24 +374,13 @@
 
 #                 ep = norm_val(emp_part)
 
-#                 # EMPRESA
 #                 if ep == "EMPRESA":
 #                     fiabilizadas += 1
 
-#                 # PARTICULAR
 #                 elif ep == "PARTICULAR":
-
 #                     dv = norm_val(doc_valido)
-
-#                     if dv in {
-#                         "SIM",
-#                         "SEM DATA DE VALIDADE",
-#                     }:
+#                     if dv in {"SIM", "SEM DATA DE VALIDADE"}:
 #                         fiabilizadas += 1
-
-#         # ========================================================
-#         # POR FIABILIZAR
-#         # ========================================================
 
 #         por_fiabilizar = total_entidades - fiabilizadas
 
@@ -484,76 +398,100 @@
 
 
 # # ============================================================
+# # PROCESSAMENTO EM BACKGROUND
+# # ============================================================
+
+# async def run_processing(job_id: str, temp_path: str):
+#     loop = asyncio.get_event_loop()
+
+#     try:
+#         result = await loop.run_in_executor(executor, process_eact, temp_path)
+#         jobs[job_id] = {"status": "done", "result": result}
+
+#     except Exception as exc:
+#         jobs[job_id] = {
+#             "status": "error",
+#             "error": f"{type(exc).__name__}: {exc}",
+#         }
+
+#     finally:
+#         try:
+#             Path(temp_path).unlink(missing_ok=True)
+#         except Exception:
+#             pass
+
+
+# # ============================================================
 # # ROUTES
 # # ============================================================
 
 # @app.get("/")
 # async def root():
-#     return {
-#         "status": "ok",
-#         "service": "EACT FastAPI backend",
-#     }
+#     return {"status": "ok", "service": "EACT FastAPI backend"}
 
 
-# @app.post("/api/eact")
-# async def upload_eact(file: UploadFile = File(...)):
+# @app.post("/api/eact/upload-chunk")
+# async def upload_chunk(
+#     file: UploadFile = File(...),
+#     uploadId: str = Form(...),
+#     chunkIndex: int = Form(...),
+#     totalChunks: int = Form(...),
+# ):
+#     """
+#     Recebe UM pedaço do ficheiro de cada vez (ex: 5MB). Cada
+#     pedaço é um request pequeno e rápido — nunca fica perto de
+#     nenhum timeout de proxy, seja qual for a velocidade de upload
+#     do utilizador.
 
-#     if not file.filename:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Ficheiro em falta.",
-#         )
+#     O frontend envia os pedaços em ordem, um a um (espera a
+#     resposta de cada um antes de enviar o seguinte), por isso
+#     basta concatenar por ordem de chegada.
+#     """
 
-#     temp_path = None
+#     if uploadId not in uploads:
+#         temp = NamedTemporaryFile(suffix=".xlsx", prefix="eact-", delete=False)
+#         temp_path = temp.name
+#         temp.close()
 
-#     try:
-#         # --------------------------------------------------------
-#         # Guardar upload em disco por chunks
-#         # --------------------------------------------------------
+#         uploads[uploadId] = {
+#             "path": temp_path,
+#             "received": 0,
+#             "total": totalChunks,
+#         }
 
-#         with NamedTemporaryFile(
-#             suffix=".xlsx",
-#             prefix="eact-",
-#             delete=False,
-#         ) as temp:
+#     info = uploads[uploadId]
 
-#             temp_path = temp.name
+#     chunk_bytes = await file.read()
 
-#             while True:
-#                 chunk = await file.read(1024 * 1024)
+#     with open(info["path"], "ab") as f:
+#         f.write(chunk_bytes)
 
-#                 if not chunk:
-#                     break
+#     info["received"] += 1
 
-#                 temp.write(chunk)
+#     is_last = info["received"] >= info["total"]
 
-#         # --------------------------------------------------------
-#         # Processar Excel
-#         # --------------------------------------------------------
+#     if is_last:
+#         job_id = str(uuid.uuid4())
+#         jobs[job_id] = {"status": "processing"}
 
-#         result = process_eact(temp_path)
+#         temp_path = info["path"]
+#         del uploads[uploadId]
 
-#         return result
+#         asyncio.create_task(run_processing(job_id, temp_path))
 
-#     except Exception as exc:
+#         return {"done": True, "job_id": job_id}
 
-#         print(f"Erro /api/eact: {type(exc).__name__}: {exc}")
+#     return {"done": False, "received": info["received"], "total": info["total"]}
 
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"{type(exc).__name__}: {exc}",
-#         )
 
-#     finally:
+# @app.get("/api/eact/status/{job_id}")
+# async def eact_status(job_id: str):
+#     job = jobs.get(job_id)
 
-#         await file.close()
+#     if job is None:
+#         raise HTTPException(status_code=404, detail="Job não encontrado.")
 
-#         if temp_path:
-#             try:
-#                 Path(temp_path).unlink(missing_ok=True)
-#             except Exception:
-#                 pass
-
+#     return job
 
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, date, timedelta
@@ -616,13 +554,12 @@ def normalize_text(value) -> str:
 
     import unicodedata
 
-    return (
-        unicodedata.normalize("NFD", str(value))
-        .encode("ascii", "ignore")
-        .decode("ascii")
-        .lower()
-        .strip()
+    normalized = unicodedata.normalize("NFD", str(value))
+    normalized = "".join(
+        char for char in normalized
+        if unicodedata.category(char) != "Mn"
     )
+    return normalized.lower().strip()
 
 
 def norm_val(value) -> str:
@@ -632,6 +569,7 @@ def norm_val(value) -> str:
     return (
         str(value)
         .replace("\u00a0", " ")
+        
         .strip()
         .upper()
     )
@@ -741,6 +679,16 @@ def get_created_date(file_path: str):
 # ============================================================
 
 def process_eact(file_path: str):
+    """
+    Processa o EACT com a mesma lógica do route.ts.
+
+    Diferença importante em relação à implementação anterior:
+    - Total de Entidades EACT: conjunto de ENTIDADE_ASSOCIADA apenas para
+      registos que não estejam ENCERRADA e cuja ENTIDADE_SOLTA seja NAO.
+    - Fiabilizada: por entidade, considera a DT_ACT MAIS RECENTE entre
+      todas as contas que cumprem INFO_ACT + Empresa/Particular + documento.
+      A janela de datas só é aplicada depois de encontrar a DT_ACT máxima global.
+    """
     created_date = get_created_date(file_path)
 
     workbook = load_workbook(
@@ -758,7 +706,12 @@ def process_eact(file_path: str):
         vistos_solta = set()
         entidades_solta_count = 0
 
-        entidades_eact = {}
+        # Equivalente ao totalEntidadesSet do route.ts.
+        total_entidades_set = set()
+
+        # Equivalente ao Map candidatas do route.ts:
+        # entidade -> DT_ACT mais recente entre as contas qualificadas.
+        candidatas = {}
 
         max_dt_act_raw = None
         max_dt_act_parsed_for_now = None
@@ -767,103 +720,111 @@ def process_eact(file_path: str):
 
         worksheet = None
 
+        # O route.ts percorre as folhas e processa todas as que contenham
+        # "export" no nome. Normalmente existe apenas uma.
         for ws in workbook.worksheets:
             sheet_name = normalize_text(ws.title)
 
-            if "export" in sheet_name:
-                worksheet = ws
-                break
-
-        if worksheet is None:
-            raise ValueError("Não foi encontrada a folha EXPORT no ficheiro EACT.")
-
-        rows = worksheet.iter_rows(values_only=True)
-
-        try:
-            header_row = next(rows)
-        except StopIteration:
-            raise ValueError("A folha EXPORT está vazia.")
-
-        header = [normalize_text(value) for value in header_row]
-
-        def find_column(name: str) -> int:
-            target = normalize_text(name)
-
-            try:
-                return header.index(target)
-            except ValueError:
-                return -1
-
-        c_sit = find_column("DSC_SIT")
-        c_contrato = find_column("COD_CONTRATO")
-        c_ent_solta = find_column("ENTIDADE_SOLTA")
-        c_ent_assoc = find_column("ENTIDADE_ASSOCIADA")
-        c_info_act = find_column("INFO_ACT")
-        c_dt_act = find_column("DT_ACT")
-        c_emp_part = find_column("DSC_EMP_PART")
-        c_doc_valido = find_column("DOCUMENTO_VALIDO")
-
-        required_columns = {
-            "DSC_SIT": c_sit,
-            "COD_CONTRATO": c_contrato,
-            "ENTIDADE_SOLTA": c_ent_solta,
-            "ENTIDADE_ASSOCIADA": c_ent_assoc,
-            "INFO_ACT": c_info_act,
-            "DT_ACT": c_dt_act,
-            "DSC_EMP_PART": c_emp_part,
-            "DOCUMENTO_VALIDO": c_doc_valido,
-        }
-
-        missing = [name for name, index in required_columns.items() if index == -1]
-
-        if missing:
-            raise ValueError("Colunas obrigatórias em falta: " + ", ".join(missing))
-
-        for row in rows:
-
-            if all(value is None for value in row):
-                consecutive_empty += 1
-
-                if consecutive_empty > 2000:
-                    break
-
+            if "export" not in sheet_name:
                 continue
 
-            consecutive_empty = 0
-            total_bruto += 1
+            rows = ws.iter_rows(values_only=True)
 
-            def get_value(index):
-                if index >= len(row):
-                    return None
-                return row[index]
+            try:
+                header_row = next(rows)
+            except StopIteration:
+                continue
 
-            sit = norm_val(get_value(c_sit))
-            ent_solta = norm_val(get_value(c_ent_solta))
+            header = [normalize_text(value) for value in header_row]
 
-            if sit == "ENCERRADA":
-                key = get_value(c_contrato)
-                if key not in vistos_enc:
-                    vistos_enc.add(key)
-                    encerradas += 1
+            def find_column(name: str) -> int:
+                target = normalize_text(name)
 
-            if ent_solta == "SIM":
-                key = get_value(c_ent_assoc)
-                if key not in vistos_solta:
-                    vistos_solta.add(key)
-                    entidades_solta_count += 1
+                try:
+                    return header.index(target)
+                except ValueError:
+                    return -1
 
-            if sit != "ENCERRADA" and ent_solta == "NAO":
+            c_sit = find_column("DSC_SIT")
+            c_contrato = find_column("COD_CONTRATO")
+            c_ent_solta = find_column("ENTIDADE_SOLTA")
+            c_ent_assoc = find_column("ENTIDADE_ASSOCIADA")
+            c_info_act = find_column("INFO_ACT")
+            c_dt_act = find_column("DT_ACT")
+            c_emp_part = find_column("DSC_EMP_PART")
+            c_doc_valido = find_column("DOCUMENTO_VALIDO")
 
-                ent = get_value(c_ent_assoc)
+            required_columns = {
+                "DSC_SIT": c_sit,
+                "COD_CONTRATO": c_contrato,
+                "ENTIDADE_SOLTA": c_ent_solta,
+                "ENTIDADE_ASSOCIADA": c_ent_assoc,
+                "INFO_ACT": c_info_act,
+                "DT_ACT": c_dt_act,
+                "DSC_EMP_PART": c_emp_part,
+                "DOCUMENTO_VALIDO": c_doc_valido,
+            }
 
-                if ent not in entidades_eact:
-                    entidades_eact[ent] = {
-                        "infoAct": get_value(c_info_act),
-                        "dtActRaw": get_value(c_dt_act),
-                        "empPart": get_value(c_emp_part),
-                        "docValido": get_value(c_doc_valido),
-                    }
+            missing = [
+                name
+                for name, index in required_columns.items()
+                if index == -1
+            ]
 
+            if missing:
+                raise ValueError(
+                    "Colunas obrigatórias em falta: " + ", ".join(missing)
+                )
+
+            for row in rows:
+                # Equivalente ao:
+                # vals.every((v) => v === undefined || v === null)
+                if all(value is None for value in row):
+                    consecutive_empty += 1
+
+                    # O ficheiro pode declarar 1.048.576 linhas, mas ter
+                    # dados apenas nas primeiras centenas de milhares.
+                    if consecutive_empty > 2000:
+                        break
+
+                    continue
+
+                consecutive_empty = 0
+                total_bruto += 1
+
+                def get_value(index):
+                    if index < 0 or index >= len(row):
+                        return None
+                    return row[index]
+
+                sit = norm_val(get_value(c_sit))
+                ent_solta = norm_val(get_value(c_ent_solta))
+
+                # --------------------------------------------------------
+                # ENCERRADAS
+                # --------------------------------------------------------
+                if sit == "ENCERRADA":
+                    key = get_value(c_contrato)
+
+                    if key not in vistos_enc:
+                        vistos_enc.add(key)
+                        encerradas += 1
+
+                # --------------------------------------------------------
+                # ENTIDADES SOLTAS
+                # --------------------------------------------------------
+                if ent_solta == "SIM":
+                    key = get_value(c_ent_assoc)
+
+                    if key not in vistos_solta:
+                        vistos_solta.add(key)
+                        entidades_solta_count += 1
+
+                # --------------------------------------------------------
+                # DATA MÁXIMA GLOBAL
+                # --------------------------------------------------------
+                # O route.ts calcula a máxima global antes de excluir
+                # ENCERRADA/entidade solta.
                 provisional_ref = (
                     max_dt_act_parsed_for_now
                     if max_dt_act_parsed_for_now is not None
@@ -871,71 +832,122 @@ def process_eact(file_path: str):
                 )
 
                 dt_raw = get_value(c_dt_act)
-                d_parsed = parse_dt_act(dt_raw, provisional_ref)
+                d_parsed_global = parse_dt_act(
+                    dt_raw,
+                    provisional_ref,
+                )
 
-                if d_parsed is not None and (
+                if d_parsed_global is not None and (
                     max_dt_act_parsed_for_now is None
-                    or d_parsed > max_dt_act_parsed_for_now
+                    or d_parsed_global > max_dt_act_parsed_for_now
                 ):
-                    max_dt_act_parsed_for_now = d_parsed
+                    max_dt_act_parsed_for_now = d_parsed_global
+
                     if isinstance(dt_raw, str):
                         max_dt_act_raw = dt_raw
 
-        total_entidades = len(entidades_eact)
-
-        final_ref = created_date or datetime.now()
-
-        max_dt_act = (
-            parse_dt_act(max_dt_act_raw, final_ref) if max_dt_act_raw else None
-        )
-
-        fiabilizadas = 0
-
-        if max_dt_act is not None:
-
-            same_day = False
-
-            if created_date is not None:
-                same_day = (
-                    max_dt_act.year == created_date.year
-                    and max_dt_act.month == created_date.month
-                    and max_dt_act.day == created_date.day
-                )
-
-            ref_date = max_dt_act
-
-            if same_day:
-                ref_date = ref_date - timedelta(days=1)
-
-            inicio_janela = ref_date.replace(year=ref_date.year - 2)
-
-            for entity in entidades_eact.values():
-
-                info_act = entity["infoAct"]
-                dt_act_raw = entity["dtActRaw"]
-                emp_part = entity["empPart"]
-                doc_valido = entity["docValido"]
-
-                if norm_val(info_act) != "SIM":
+                # --------------------------------------------------------
+                # EXCLUSÕES PARA TOTAL ENTIDADES / FIABILIZADAS
+                # --------------------------------------------------------
+                if sit == "ENCERRADA" or ent_solta != "NAO":
                     continue
 
-                dt = parse_dt_act(dt_act_raw, final_ref)
+                ent = get_value(c_ent_assoc)
+
+                # Total Entidades EACT:
+                # uma entidade conta uma única vez.
+                total_entidades_set.add(ent)
+
+                # --------------------------------------------------------
+                # CANDIDATA A FIABILIZADA
+                # --------------------------------------------------------
+                info_act = norm_val(get_value(c_info_act))
+                emp_part = norm_val(get_value(c_emp_part))
+                doc_valido = norm_val(get_value(c_doc_valido))
+
+                qualifica = (
+                    info_act == "SIM"
+                    and (
+                        emp_part == "EMPRESA"
+                        or (
+                            emp_part == "PARTICULAR"
+                            and doc_valido in {
+                                "SIM",
+                                "SEM DATA DE VALIDADE",
+                            }
+                        )
+                    )
+                )
+
+                if not qualifica:
+                    continue
+
+                # A data só é considerada candidata se for válida.
+                dt = parse_dt_act(dt_raw, provisional_ref)
 
                 if dt is None:
                     continue
 
-                if dt < inicio_janela or dt > ref_date:
-                    continue
+                # IMPORTANTE:
+                # Não guardamos a primeira linha da entidade.
+                # Guardamos a DT_ACT mais recente entre TODAS as contas
+                # qualificadas dessa entidade.
+                atual = candidatas.get(ent)
 
-                ep = norm_val(emp_part)
+                if atual is None or dt > atual:
+                    candidatas[ent] = dt
 
-                if ep == "EMPRESA":
+        # Se não houver nenhuma folha EXPORT, reproduz o erro esperado.
+        if not any(
+            "export" in normalize_text(ws.title)
+            for ws in workbook.worksheets
+        ):
+            raise ValueError(
+                "Não foi encontrada a folha EXPORT no ficheiro EACT."
+            )
+
+        total_entidades = len(total_entidades_set)
+
+        # ------------------------------------------------------------
+        # REFERÊNCIA FINAL / DATA MÁXIMA REAL
+        # ------------------------------------------------------------
+        final_ref = created_date or datetime.now()
+
+        max_dt_act = (
+            parse_dt_act(max_dt_act_raw, final_ref)
+            if max_dt_act_raw
+            else None
+        )
+
+        # ------------------------------------------------------------
+        # FIABILIZADAS
+        # ------------------------------------------------------------
+        fiabilizadas = 0
+
+        if max_dt_act is not None:
+            same_day = (
+                created_date is not None
+                and max_dt_act.year == created_date.year
+                and max_dt_act.month == created_date.month
+                and max_dt_act.day == created_date.day
+            )
+
+            ref_date = max_dt_act
+
+            # Se a DT_ACT máxima tiver a mesma data da criação do ficheiro,
+            # a janela termina no dia anterior.
+            if same_day:
+                ref_date = ref_date - timedelta(days=1)
+
+            inicio_janela = ref_date.replace(
+                year=ref_date.year - 2
+            )
+
+            # Cada entidade aparece no máximo uma vez em candidatas,
+            # usando a sua DT_ACT qualificada mais recente.
+            for dt in candidatas.values():
+                if inicio_janela <= dt <= ref_date:
                     fiabilizadas += 1
-
-                elif ep == "PARTICULAR":
-                    dv = norm_val(doc_valido)
-                    if dv in {"SIM", "SEM DATA DE VALIDADE"}:
-                        fiabilizadas += 1
 
         por_fiabilizar = total_entidades - fiabilizadas
 

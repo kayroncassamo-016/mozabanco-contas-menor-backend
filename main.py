@@ -493,6 +493,8 @@
 
 #     return job
 
+
+
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -709,8 +711,9 @@ def process_eact(file_path: str):
         # Equivalente ao totalEntidadesSet do route.ts.
         total_entidades_set = set()
 
-        # Equivalente ao Map candidatas do route.ts:
-        # entidade -> DT_ACT mais recente entre as contas qualificadas.
+        # Entidades que possuem pelo menos uma conta qualificável.
+        # Guardamos as DT_ACT qualificadas para, no fim, verificar se
+        # EXISTE pelo menos uma dentro da janela de 2 anos.
         candidatas = {}
 
         max_dt_act_raw = None
@@ -889,13 +892,12 @@ def process_eact(file_path: str):
                     continue
 
                 # IMPORTANTE:
-                # Não guardamos a primeira linha da entidade.
-                # Guardamos a DT_ACT mais recente entre TODAS as contas
-                # qualificadas dessa entidade.
-                atual = candidatas.get(ent)
-
-                if atual is None or dt > atual:
-                    candidatas[ent] = dt
+                # A entidade fica candidata se EXISTIR pelo menos uma
+                # conta qualificada. Não usamos a DT_ACT mais recente
+                # como representante da entidade, porque uma conta mais
+                # recente fora da janela não pode invalidar outra conta
+                # qualificada que esteja dentro da janela.
+                candidatas.setdefault(ent, []).append(dt)
 
         # Se não houver nenhuma folha EXPORT, reproduz o erro esperado.
         if not any(
@@ -943,10 +945,10 @@ def process_eact(file_path: str):
                 year=ref_date.year - 2
             )
 
-            # Cada entidade aparece no máximo uma vez em candidatas,
-            # usando a sua DT_ACT qualificada mais recente.
-            for dt in candidatas.values():
-                if inicio_janela <= dt <= ref_date:
+            # Uma entidade é fiabilizada se EXISTIR pelo menos uma
+            # conta qualificada cuja DT_ACT esteja dentro da janela.
+            for datas in candidatas.values():
+                if any(inicio_janela <= dt <= ref_date for dt in datas):
                     fiabilizadas += 1
 
         por_fiabilizar = total_entidades - fiabilizadas

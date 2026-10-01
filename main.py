@@ -4497,8 +4497,8 @@ def process_eact(
 
             # ==================================================
             # UNIVERSO
-            # ==================================================
-
+            # ============================
+            
             if is_encerrada(
                 row,
                 columns,
@@ -4944,5 +4944,7 @@ async def eact_status(
             status_code=404,
             detail="Job não encontrado.",
         )
+
+
 
     return job

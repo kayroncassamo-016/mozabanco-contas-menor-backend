@@ -3800,7 +3800,7 @@ import asyncio
 import os
 import re
 import uuid
-
+from typing import Any, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 
 from openpyxl import load_workbook
@@ -3897,62 +3897,120 @@ def _as_datetime(value) -> datetime:
     return datetime.now()
 
 
+# def parse_dt_act(
+#     value,
+#     ref_for_century: datetime | date,
+# ):
+#     """
+#     DT_ACT vem como texto 'AA.MM.DD'.
+
+#     Exemplo:
+#         24.05.17 -> 17/05/2024
+
+#     Se 20XX ficar no futuro relativamente à referência,
+#     assume-se 19XX.
+#     """
+
+#     if not isinstance(value, str):
+#         return None
+
+#     value = value.strip()
+
+#     match = re.fullmatch(
+#         r"(\d{2})\.(\d{2})\.(\d{2})",
+#         value,
+#     )
+
+#     if not match:
+#         return None
+
+#     yy, mm, dd = match.groups()
+
+#     year = 2000 + int(yy)
+
+#     try:
+#         parsed = datetime(
+#             year,
+#             int(mm),
+#             int(dd),
+#         )
+
+#     except ValueError:
+#         return None
+
+#     if parsed > _as_datetime(ref_for_century):
+
+#         year = 1900 + int(yy)
+
+#         try:
+#             parsed = datetime(
+#                 year,
+#                 int(mm),
+#                 int(dd),
+#             )
+
+#         except ValueError:
+#             return None
+
+#     return parsed
+
+
 def parse_dt_act(
     value,
-    ref_for_century: datetime | date,
-):
-    """
-    DT_ACT vem como texto 'AA.MM.DD'.
-
-    Exemplo:
-        24.05.17 -> 17/05/2024
-
-    Se 20XX ficar no futuro relativamente à referência,
-    assume-se 19XX.
-    """
-
-    if not isinstance(value, str):
+    reference_date: datetime,
+) -> Optional[datetime]:
+    if value is None:
         return None
 
-    value = value.strip()
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
 
-    match = re.fullmatch(
-        r"(\d{2})\.(\d{2})\.(\d{2})",
-        value,
-    )
-
-    if not match:
-        return None
-
-    yy, mm, dd = match.groups()
-
-    year = 2000 + int(yy)
-
-    try:
-        parsed = datetime(
-            year,
-            int(mm),
-            int(dd),
+    if isinstance(value, date):
+        return datetime(
+            value.year,
+            value.month,
+            value.day,
         )
 
-    except ValueError:
+    text = str(value).strip()
+
+    if not text:
         return None
 
-    if parsed > _as_datetime(ref_for_century):
-
-        year = 1900 + int(yy)
-
+    # Formato: YYYY-MM-DD HH:MM:SS
+    # Exemplo: 2025-03-29 00:00:00
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y.%m.%d",
+    ):
         try:
-            parsed = datetime(
-                year,
-                int(mm),
-                int(dd),
-            )
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+
+    # Formato: YY-MM-DD
+    # Exemplo: 25-03-29
+    for fmt in (
+        "%y-%m-%d",
+        "%y.%m.%d",
+    ):
+        try:
+            parsed = datetime.strptime(text, fmt)
+
+            # Mantém a mesma lógica do formato YY.MM.DD:
+            # inicialmente considera 20xx.
+            if parsed > reference_date:
+                parsed = parsed.replace(
+                    year=parsed.year - 100
+                )
+
+            return parsed
 
         except ValueError:
-            return None
+            pass
 
-    return parsed
+    return None
 
 
 # ============================================================

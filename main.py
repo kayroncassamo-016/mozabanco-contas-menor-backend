@@ -2134,7 +2134,7 @@ def row_is_fiabilizada(
 
     # O limite inferior da janela é exclusivo.
     # Ex.: com ref_date = 03/08/2026, 03/08/2024 não recebe X.
-    if dt < inicio_janela:
+    if dt <= inicio_janela:
         return False
 
     if dt > ref_date:
